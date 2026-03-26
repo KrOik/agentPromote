@@ -1,0 +1,49 @@
+感谢aiwithjainam/status/2031282913422225567 from X提供思路，这里做路径重规划处理
+我们建议您参照Leey21/awesome-ai-research-writing from github安装配置skills，以及辅佐obra/superpowers from github以增强您的助手/plan表现，当然，oh my codex/cc 也必不可少，$ralph的结构性提示非常强大
+1.提供一篇参考文献到meta.so ，配合下文提示词，以得到领域相关论文。
+>    查找这篇文献强相关领域的所有文献，以真实doi和可访问链接提供为交付列表，格式参考：1. List every paper by author + year + core claim in one sentence
+>    2. Group them into clusters of shared assumptions
+>    3. Flag any paper that contradicts another
+>    Don't summarize. Map the landscape."
+2.构建rag，meta.so 可提供相关功能，但也可使用cc/codex完成，配合提示词：
+  Most researchers miss this. This prompt doesn't:
+"Across all papers uploaded, identify every point where two
+or more authors directly contradict each other.
+For each contradiction:
+- State both positions
+- Name the papers
+- Explain WHY they
+3.构建你的引用列表，让你明白文献关系
+"Pick the 3 most-cited concepts across these papers.
+For each concept:
+- Who introduced it first?
+- Who challenged it?
+- Who refined it?
+- What's the current consensus (if any)?
+Show me the intellectual lineage like a family tree."
+4.确立你的研究创新点，和引用列表给审稿人构建，或者说，想给他展现的一个知识网，在网之中有什么漏洞，你的研究将进行补齐
+  "Based on all uploaded papers, identify the 5 research
+questions that NOBODY has fully answered yet.
+
+For each gap:
+- Why does it exist? (too hard, too niche, overlooked?)
+- Which existing paper came closest to
+5.描绘你的研究方法：
+  Compare the research methodologies used across all papers.
+
+Group by: surveys, experiments, simulations, meta-analyses,
+case studies.
+
+Then flag:
+- Which methodology dominates this field and why?
+- Which methodology is underused?
+- Which paper's
+6.确定综述："You now have a full picture of this literature.
+
+Write a synthesis that does NOT summarize individual papers.
+
+Instead:
+- State what the field collectively believes
+- State what remains contested
+
+7.
