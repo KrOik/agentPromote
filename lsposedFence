@@ -1,0 +1,297 @@
+# LSPosed Module Security Audit Skill
+
+Systematic security review framework for Android LSPosed/Xposed modules, distilled from the KunYuShu (坤舆枢) full-stack audit covering 493 files across 14 review dimensions. Covers Java/Kotlin layer, native C/C++ layer, IPC boundary, anti-detection, build config, and runtime hardening.
+
+## Severity Framework
+
+| Level | Definition | Response |
+|-------|-----------|----------|
+| CRITICAL | System crash (SIGSEGV/ANR/soft-reboot), data breach, code injection | Must fix immediately |
+| HIGH | Probable runtime exception, state corruption, anti-detection bypass | Should fix promptly |
+| MEDIUM | Conditional race, specific scenario reproducible | Should fix |
+| LOW | Theoretical risk, hardening opportunity | Optional |
+| INFO | Documented acceptable risk | Track only |
+
+---
+
+## Checklist 1: ContentProvider / IPC Security
+
+### 1.1 Provider Authentication
+- [ ] `query()` has `Binder.getCallingUid()` check (NOT only `insert()`/`update()`)
+- [ ] `enforceAllowedReader()` validates against `SYSTEM_UID` or self-UID
+- [ ] Manifest declares `android:permission` with `signature` level
+- [ ] Manifest sets `android:grantUriPermissions="false"`
+- [ ] No bypass via `call()` method
+
+### 1.2 IPC Encryption (if custom command channel)
+- [ ] Session key uses `SecureRandom` (256-bit minimum)
+- [ ] AES-CTR with random IV per field (never reuse IV)
+- [ ] HMAC-SHA256 signature covering commandId + nonce + timestamp + sequence
+- [ ] Constant-time HMAC comparison (`constantTimeEquals`, not `!=`)
+- [ ] Replay protection: 30s time window + nonce dedup (512-2048 entry LRU)
+- [ ] Outer session key comparison also constant-time (not short-circuit `!=`)
+- [ ] `exchange_key` uses UID check via `BinderUtils.isManagerApp()`
+- [ ] Each command wrapped in `runCatching` for atomicity
+
+### 1.3 Payload Validation
+- [ ] Array/bundle size caps (e.g., `count <= 500`) to prevent OOM DoS
+- [ ] Nonce cache has upper bound (FIFO eviction after N entries)
+- [ ] Sequence number monotonic check
+- [ ] Timestamp within valid window
+
+---
+
+## Checklist 2: File Permissions & Path Security
+
+### 2.1 SharedPreferences
+- [ ] NO `chmod 666` on SharedPreferences XML files
+- [ ] `fixPermissions()` uses `setReadable(true, true)` = owner-only
+- [ ] Root fallback uses `chmod 600` with `canonicalPath` symbol-link guard
+- [ ] `commit()` replaced with `apply()` to avoid sync IO block
+- [ ] 30+ field single-transaction writes reviewed for split potential
+
+### 2.2 Temporary / External Files
+- [ ] NO config mirror to `/data/local/tmp/` (global readable)
+- [ ] Ephemeris/rinex files in `context.filesDir` (private), NOT `/data/local/tmp/`
+- [ ] `copyTo` followed immediately by `setReadable`/`setWritable` (permission window)
+- [ ] Step counter persistence uses `chmod 600`, not `666`
+
+### 2.3 Native Library Loading (TOCTOU)
+- [ ] SO loaded from system-protected `nativeLibraryDir`, NOT `/data/local/tmp/`
+- [ ] Random file names (`libkys_*.so` pattern)
+- [ ] `canonicalPath` symbol-link TOCTOU guard before `System.load()`
+- [ ] `load_library` remote command explicitly disabled
+- [ ] SHA-256 integrity check on loaded SO (optional but recommended)
+
+### 2.4 Backup & Data Extraction
+- [ ] `backup_rules.xml` excludes `sharedpref` and `database` domains
+- [ ] `data_extraction_rules.xml` same exclusion
+- [ ] `allowBackup` is `false` OR exclusion rules verified effective
+
+---
+
+## Checklist 3: Concurrency & Thread Safety
+
+### 3.1 Shared Mutable State (Kotlin/Java)
+- [ ] All multi-thread-accessed `var` fields use `@Volatile`
+- [ ] God objects (60+ var fields in one singleton) identified and flagged
+- [ ] `HashMap` used in multi-thread context → `ConcurrentHashMap`
+- [ ] Counter fields use `AtomicInteger`, not bare `Int`
+- [ ] Check-then-act patterns protected by lock or atomic CAS
+- [ ] `forceDisable` guard pattern: volatile write before enable toggle
+
+### 3.2 Coroutine Safety
+- [ ] NO `GlobalScope` in ViewModel (use `viewModelScope` or lifecycle-aware scope)
+- [ ] `isPaused` flags are `@Volatile` or `AtomicBoolean` (channel happens-before insufficient for external readers)
+- [ ] `while (channel.receive() != Resume)` has timeout break (5s) to prevent permanent hang
+- [ ] Pause/resume controllers genericized (not duplicated in `CoroutineController` + `CoroutineRouteMock`)
+
+### 3.3 Native Concurrency (C/C++)
+- [ ] `OBFUSCATE` macro static init uses `std::atomic<bool>` or `std::once_flag`
+- [ ] `initLinearMap()` lazy init uses `std::call_once` or mutex
+- [ ] Global char buffers (`g_app_cache_dir`) have proper memory ordering
+- [ ] Shared memory struct copies are atomic or use seqlock pattern
+- [ ] `thread_local` recursion guards for hook callbacks
+
+---
+
+## Checklist 4: Native C/C++ Code Safety
+
+### 4.1 Dobby Inline Hook Safety
+- [ ] ALL `DobbyHook` return values checked (non-zero → orig = nullptr)
+- [ ] ALL `orig_*` function pointers null-checked before call (syscall fallback on null)
+- [ ] Constructor hooks gated by `is_system_server_process()` check
+- [ ] `install_hooks()` uses `std::atomic_bool` re-entrance guard
+- [ ] Hook installation wrapped in `safe_execute_failfast` (G3) or `safe_execute_with_watchdog` (G4/G5)
+
+### 4.2 ELF/Memory Parsing
+- [ ] `e_shnum` upper bound check before for-loop (prevent OOB read on corrupted ELF)
+- [ ] `sh_offset` validated within `[0, mmap_size)` before `offsetOf<T>()`
+- [ ] `std::stol` replaced with `strtoull` (no exception → `std::terminate`)
+- [ ] `initModuleBase` has try/catch or uses non-throwing parse
+- [ ] `PT_LOAD` range detection iterates ALL segments (max `end`), not `break` on first
+
+### 4.3 Signal Safety
+- [ ] `crash_recovery_handler`: only async-signal-safe functions (`write`, `open`, `close`, `siglongjmp`)
+- [ ] NO `malloc`, `printf`, `mutex_lock` in signal handler
+- [ ] Code ranges (`is_our_address()`) initialized BEFORE `sigaction` install
+- [ ] Watchdog `pthread_detach` path: worker must NOT hold ART locks or JNI env
+- [ ] `CRASH_RECOVERY_END` recovered-flag checked correctly (not `active` which is always reset)
+
+### 4.4 Page Size Compatibility
+- [ ] `-Wl,-z,max-page-size=16384` in CMakeLists.txt for 16KB page devices (Android 15+)
+- [ ] Dobby POSIX patch path uses dynamic `sysconf(_SC_PAGESIZE)`
+- [ ] Verify with `llvm-readelf -l` that `PT_LOAD Align` = 0x4000
+
+---
+
+## Checklist 5: Code Quality & Architecture
+
+### 5.1 God Object Detection
+- [ ] Any `object` singleton with >20 `var` fields (flag as God Object)
+- [ ] State proxy layers (direct getter/setter delegation) — eliminate or justify
+- [ ] Any class >1000 lines (split by responsibility)
+
+### 5.2 Kotlin Anti-Patterns
+- [ ] Extension property abuse (>10 ext props on `Context` for SharedPreferences)
+- [ ] Recursive retry → `while` loop
+- [ ] `forEach { }` + lambda in hot path → `for (x in items)` 
+- [ ] `runCatching` in dispatch loop → `try/catch`
+- [ ] Commented-out code blocks >10 lines → delete
+- [ ] Key name typos in SP (e.g., `Regitser` → `Register`)
+- [ ] Dead imports / unused variable bindings
+
+### 5.3 Reflection Usage
+- [ ] Method references cached in `@Volatile` variables (not per-call `firstOrNull`)
+- [ ] Constructor reflection cached (not `constructor.newInstance()` per GNSS cycle)
+- [ ] `hookAllMethods` return value not discarded (use count-check variant instead)
+
+### 5.4 Shell Command Safety
+- [ ] `ShellUtils` validates command against whitelist (`ALLOWED_ROOT_COMMANDS`)
+- [ ] No `rm`, `sh`, `echo`, `dd` in whitelist
+- [ ] Parameters validated: non-empty, no NUL bytes, regex `[A-Za-z0-9._+-]+`
+- [ ] Shell quoting via `quoteForRootShell()` (single-quote wrapping)
+- [ ] Unused `setEnforceMode()` dead code removed
+
+---
+
+## Checklist 6: Anti-Detection Hardening
+
+### 6.1 String Obfuscation
+- [ ] XOR key space >8 bits (current single-byte key = 256 brute-force)
+- [ ] All filter markers obfuscated (not bare strings in `maps_filter.cpp`)
+- [ ] Decrypted strings zeroed after use (not persistent in `_buf`)
+- [ ] `OBFUSCATE` static init uses atomic guard (concurrency review item)
+
+### 6.2 Backtrace & Maps Filtering
+- [ ] `backtrace()` hooked AND `_Unwind_Backtrace` hooked (not deferred)
+- [ ] `open`/`openat` maps filter active in RELEASE builds (not `#ifdef DEBUG` only)
+- [ ] `/proc/self/exe`, `/proc/*/task/*/status`, `/sys/kernel/` paths covered
+- [ ] `readlink /proc/self/fd/N` bypass addressed
+- [ ] `memfd_create` FD redirection working for all maps variants
+- [ ] JNI trampoline frames (`art_quick_generic_jni_trampoline`) filtered
+- [ ] Region detection uses file-name pattern + ELF identifier (not just `strstr`)
+
+### 6.3 Sensor Randomization Quality
+- [ ] Per-sample noise added (not static values set once at startup)
+- [ ] Gyroscope random walk drift simulated
+- [ ] Step counter values consistent across `SensorEventQueueWrite` AND `ConvertToSensorEvent`
+- [ ] Timestamp-value correlation preserved (not decoupled)
+- [ ] PRNG reseeded per session, not using weak `rand()`
+
+### 6.4 ArtMethod & Property Protection
+- [ ] `cacheOriginalEntryPoints()` actually populates the cache (not no-op)
+- [ ] Lookup key matches actual `Unsafe.getLong` semantics (offset, not method name)
+- [ ] `getObject` counterpart hooked (not just `getLong`)
+- [ ] `VarHandle` bypass (Android 14+) addressed
+- [ ] Property masker covers all LSPosed-exposing keys
+- [ ] `PackageManager` API filtering covers all 5 query methods
+
+---
+
+## Checklist 7: Runtime Defense Layers
+
+### 7.1 Java Exception Boundary (Layer 1)
+- [ ] ALL `system_server` hooks individually wrapped in `runCatching`
+- [ ] `handleLoadPackage` each hook init in separate try/catch
+- [ ] `handleInstruction` command dispatch in outer `runCatching`
+- [ ] Each `afterHook` method in WlanHook has per-method `runCatching`
+
+### 7.2 DomainGuard (Crash Isolation)
+- [ ] Per-domain sliding window crash counter (5/300s)
+- [ ] Install crash loop detection (3/120s → safeMode)
+- [ ] `safeMode` flag is `@Volatile`
+- [ ] Counter uses `AtomicInteger`
+- [ ] `checkInstallCrashLoop()` called at `handleLoadPackage` START
+
+### 7.3 Native Crash Recovery (Layer 2)
+- [ ] `CRASH_RECOVERY_BEGIN/END` macros used per hook function
+- [ ] Recovery counter ≤3 per boot, then terminal despair
+- [ ] Per-step disable marker written atomically on crash
+- [ ] Signal handler forwards non-own crashes to original handler
+
+### 7.4 Safety Gate Chain (Layer 3-4)
+- [ ] DESPAIR_LOCK checked first (terminal lock blocks all)
+- [ ] ART_VERSION_LOCK prevents ART manipulation after OTA
+- [ ] VERSION_GATE whitelist check for risky ops
+- [ ] BOOT_GATE safe-mode detection (`persist.sys.safemode`)
+- [ ] PERSISTENT_DISABLE per-step marker prevents retry
+- [ ] QEMU detection: 8-gate scoring + challenge token
+
+### 7.5 FlightRecorder & Diagnostics
+- [ ] Ring buffer (256 events) with bootstrap device identity
+- [ ] Persistent JSONL flush
+- [ ] CrashForensics with SHA256 fingerprint
+- [ ] BBN-tagged logging (domain-tagged error routing)
+
+---
+
+## Checklist 8: Build & Supply Chain
+
+### 8.1 Build Configuration
+- [ ] `kotlin-serialization` plugin version matches compiler version
+- [ ] NO hardcoded `org.gradle.java.home` absolute path
+- [ ] AGP public API used (not `BaseVariantOutputImpl` internal class)
+- [ ] ProGuard rules for all modules
+- [ ] Native targets: `-fvisibility=hidden`, `-Wl,--strip-all`, FULL RELRO
+
+### 8.2 Dependencies
+- [ ] fastjson2 version checked against OSV database (known DoS CVEs)
+- [ ] OkHttp: certificate pinning for critical endpoints (ephemeris download)
+- [ ] Dobby: version locked to specific commit hash (not floating `1.2`)
+- [ ] `usesCleartextTraffic` reviewed; `network_security_config.xml` preferred
+
+### 8.3 Secrets Management
+- [ ] NO hardcoded API keys in source (Baidu Map key)
+- [ ] `.env` gitignored AND never committed to history
+- [ ] `buildConfigField` from env variable for keys
+
+---
+
+## Checklist 9: Performance Hot Paths
+
+### 9.1 IO
+- [ ] `SharedPreferences.commit()` → `apply()` (async)
+- [ ] ContentProvider writes use thread pool, not `new Thread().start()`
+- [ ] Watchdog polling rate reduced when mock inactive
+
+### 9.2 Memory Allocation
+- [ ] Sensor event copy uses `thread_local` buffer, not per-call heap allocation
+- [ ] GNSS satellite state hot path: `Random` calls minimized
+- [ ] Reflection results cached (method refs, constructor refs)
+- [ ] `forEach { }` `runCatching` in dispatch loop → `for` + `try/catch`
+- [ ] NMEA parsing: lazy field extraction or pre-compiled regex
+
+### 9.3 CPU
+- [ ] GaitSimulator uses cached interpolation path (not full Fourier per sample)
+- [ ] `wrapPi` while-loop → modular arithmetic `((x + PI) % TWO_PI) - PI`
+- [ ] Loop broadcast uses `Handler.postDelayed` or coroutine `delay()`, not raw `Thread.sleep()` loop
+
+---
+
+## Checklist 10: Logging Hygiene
+
+- [ ] Release build: native `LOGD`/`LOGI`/`LOGW`/`LOGE` expand to `((void)0)`
+- [ ] `XposedBridge.log` detail level reduced in release (no mock status leak)
+- [ ] `MockProbeLog` disabled or downgraded in release builds
+- [ ] Logcat `READ_LOGS` permission exposure considered (Android <13)
+- [ ] `forceLogging` dead code removed (no setter, always false)
+
+---
+
+## Audit Process
+
+1. **Scope Definition**: Identify target modules (app APK, Xposed module, native libs, build config)
+2. **Static Analysis**: Run through all 10 checklists above, file-by-file
+3. **Cross-Reference**: Verify claim-fix alignment between review docs and actual code
+4. **Severity Assignment**: Classify each finding using the framework above
+5. **Verification Gate**: For each CRITICAL/HIGH, require concrete code evidence (file:line)
+6. **Report**: Executive summary + verified-fix table + new-finding table
+
+## Common False Positives
+
+- `allowBackup=true` with backup exclusion rules = SAFE
+- `START_STICKY` + foreground notification = standard Android pattern, NOT a bug
+- `findClassIfExists` returning null followed by null guard = SAFE
+- Session key exchange over Binder (in-kernel, non-interceptable) = ACCEPTABLE RISK
+- `LinkedHashMap` nonce cache with signature-fail early-return = CORRECT DESIGN (no cache pollution)
